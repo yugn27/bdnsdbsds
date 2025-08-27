@@ -1,0 +1,154 @@
+<!doctype html>
+<html lang="en">
+<head>
+  <meta charset="utf-8" />
+  <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover" />
+  <title>AR Tap‑to‑Place – College Building</title>
+  <meta name="theme-color" content="#000000" />
+  <style>
+    html,body{margin:0;height:100%;overflow:hidden;background:#000}
+    #ui{position:fixed;left:0;right:0;bottom:0;padding:12px 14px 18px;display:flex;gap:10px;align-items:center;justify-content:center;pointer-events:none}
+    .chip{pointer-events:auto;font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; font-size:14px; line-height:18px; padding:10px 12px; border-radius:999px; background:rgba(255,255,255,.9); box-shadow:0 6px 20px rgba(0,0,0,.25); display:flex; gap:8px; align-items:center}
+    .chip input{width:120px}
+    #hint{position:fixed;top:12px;left:50%;transform:translateX(-50%);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu; font-size:14px;color:#111;background:rgba(255,255,255,.9);padding:10px 12px;border-radius:12px;box-shadow:0 6px 20px rgba(0,0,0,.25);}
+    #enterBtn{position:fixed;top:50%;left:50%;transform:translate(-50%,-50%);font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu;padding:14px 18px;border-radius:999px;border:none;background:#fff;box-shadow:0 8px 30px rgba(0,0,0,.35);font-weight:600}
+  </style>
+</head>
+<body>
+  <div id="hint" hidden>Move your phone to scan the floor, then tap to place the model.</div>
+  <div id="ui">
+    <div class="chip">Scale <input id="scale" type="range" min="0.1" max="3" value="1" step="0.01"/><span id="scaleVal">1.00×</span></div>
+    <button class="chip" id="reset" title="Remove placed model">Reset</button>
+  </div>
+  <button id="enterBtn">Start AR</button>
+  
+  <script type="module">
+    import * as THREE from 'https://unpkg.com/three@0.158.0/build/three.module.js';
+    import { ARButton } from 'https://unpkg.com/three@0.158.0/examples/jsm/webxr/ARButton.js';
+    import { GLTFLoader } from 'https://unpkg.com/three@0.158.0/examples/jsm/loaders/GLTFLoader.js';
+
+    // ====== Config ======
+    // Provide your GLB/GLTF model URL here (must be HTTPS/CORS accessible)
+    // You can also pass ?model=https://... to override via query string.
+    const DEFAULT_MODEL = 'https://model-cdn.example.com/college-building.glb';
+
+    const params = new URLSearchParams(location.search);
+    const MODEL_URL = params.get('model') || DEFAULT_MODEL;
+
+    let camera, scene, renderer;
+    let reticle, controller;
+    let hitTestSource = null; let hitTestSourceRequested = false;
+    let placedModel = null; let modelRoot = new THREE.Group();
+
+    // Basic scene
+    scene = new THREE.Scene();
+    camera = new THREE.PerspectiveCamera(70, window.innerWidth / window.innerHeight, 0.01, 50);
+
+    renderer = new THREE.WebGLRenderer({ antialias:true, alpha:true, powerPreference:'high-performance' });
+    renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
+    renderer.setSize(window.innerWidth, window.innerHeight);
+    renderer.xr.enabled = true;
+    document.body.appendChild(renderer.domElement);
+
+    // Lighting suited for outdoor/building models
+    const hemi = new THREE.HemisphereLight(0xffffff, 0x444444, 1.1); hemi.position.set(0, 1, 0); scene.add(hemi);
+    const dir = new THREE.DirectionalLight(0xffffff, 0.9); dir.position.set(5, 10, 7.5); dir.castShadow = false; scene.add(dir);
+
+    // Reticle to show placement point
+    reticle = new THREE.Mesh(
+      new THREE.RingGeometry(0.12, 0.14, 32).rotateX(-Math.PI/2),
+      new THREE.MeshBasicMaterial({ color:0x00ff88 })
+    );
+    reticle.matrixAutoUpdate = false;
+    reticle.visible = false;
+    scene.add(reticle);
+
+    // The group that will hold the placed content (so we can scale it easily)
+    scene.add(modelRoot);
+
+    // Load model (deferred attach after first tap)
+    const loader = new GLTFLoader();
+    let modelScene = null;
+    loader.load(MODEL_URL, (gltf)=>{
+      modelScene = gltf.scene;
+      modelScene.traverse(o=>{ if(o.isMesh){ o.castShadow=false; o.receiveShadow=true; } });
+    }, (xhr)=>{ /* progress */ }, (err)=>{ console.error('Model load error', err); alert('Failed to load model. Check URL and CORS.'); });
+
+    // UI wiring
+    const scaleSlider = document.getElementById('scale');
+    const scaleVal = document.getElementById('scaleVal');
+    scaleSlider.addEventListener('input', ()=>{
+      const s = parseFloat(scaleSlider.value);
+      scaleVal.textContent = s.toFixed(2) + '×';
+      if(modelRoot) modelRoot.scale.setScalar(s);
+    });
+    document.getElementById('reset').addEventListener('click', ()=>{
+      if(placedModel){ modelRoot.remove(placedModel); placedModel = null; }
+    });
+
+    // WebXR session enter button (asks for camera permission)
+    const enterBtn = document.getElementById('enterBtn');
+    enterBtn.addEventListener('click', async ()=>{
+      try {
+        const btn = ARButton.createButton(renderer, { requiredFeatures:['hit-test','dom-overlay'], domOverlay:{ root: document.body } });
+        document.body.appendChild(btn);
+        btn.click(); // programmatically forward to open the XR prompt
+        enterBtn.remove();
+        document.getElementById('hint').hidden = false;
+      } catch(e){
+        console.error(e);
+        alert('WebXR AR not supported. Try Chrome on Android with HTTPS.');
+      }
+    });
+
+    // Controller for tap-to-place
+    controller = renderer.xr.getController(0);
+    controller.addEventListener('select', onSelect);
+    scene.add(controller);
+
+    function onSelect(){
+      if(!reticle.visible || !modelScene) return;
+      if(placedModel){ modelRoot.remove(placedModel); placedModel = null; }
+      placedModel = modelScene.clone(true);
+      placedModel.position.setFromMatrixPosition(reticle.matrix);
+      placedModel.quaternion.setFromRotationMatrix(reticle.matrix);
+      modelRoot.add(placedModel);
+    }
+
+    // Animation loop with hit-test
+    renderer.setAnimationLoop((timestamp, frame)=>{
+      if(frame){
+        const referenceSpace = renderer.xr.getReferenceSpace();
+        const session = renderer.xr.getSession();
+
+        if(!hitTestSourceRequested){
+          session.requestReferenceSpace('viewer').then((refSpace)=>{
+            session.requestHitTestSource({ space: refSpace }).then((source)=>{ hitTestSource = source; });
+          });
+          session.addEventListener('end', ()=>{ hitTestSourceRequested = false; hitTestSource = null; });
+          hitTestSourceRequested = true;
+        }
+
+        if(hitTestSource){
+          const hitTestResults = frame.getHitTestResults(hitTestSource);
+          if(hitTestResults.length){
+            const hit = hitTestResults[0];
+            const pose = hit.getPose(renderer.xr.getReferenceSpace());
+            reticle.visible = true;
+            reticle.matrix.fromArray(pose.transform.matrix);
+          } else {
+            reticle.visible = false;
+          }
+        }
+      }
+      renderer.render(scene, camera);
+    });
+
+    window.addEventListener('resize', ()=>{
+      camera.aspect = window.innerWidth / window.innerHeight;
+      camera.updateProjectionMatrix();
+      renderer.setSize(window.innerWidth, window.innerHeight);
+    });
+  </script>
+</body>
+</html>
